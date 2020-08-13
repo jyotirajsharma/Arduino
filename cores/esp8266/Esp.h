@@ -22,6 +22,7 @@
 #define ESP_H
 
 #include <Arduino.h>
+#include "spi_vendors.h"
 
 /**
  * AVR macros for WDT managment
@@ -92,7 +93,9 @@ class EspClass {
         void wdtDisable();
         void wdtFeed();
 
-        void deepSleep(uint32_t time_us, RFMode mode = RF_DEFAULT);
+        void deepSleep(uint64_t time_us, RFMode mode = RF_DEFAULT);
+        void deepSleepInstant(uint64_t time_us, RFMode mode = RF_DEFAULT);
+        uint64_t deepSleepMax();
 
         bool rtcUserMemoryRead(uint32_t offset, uint32_t *data, size_t size);
         bool rtcUserMemoryWrite(uint32_t offset, uint32_t *data, size_t size);
@@ -101,19 +104,35 @@ class EspClass {
         void restart();
 
         uint16_t getVcc();
-        uint32_t getFreeHeap();
-
         uint32_t getChipId();
+
+        uint32_t getFreeHeap();
+        uint16_t getMaxFreeBlockSize();
+        uint8_t getHeapFragmentation(); // in %
+        void getHeapStats(uint32_t* free = nullptr, uint16_t* max = nullptr, uint8_t* frag = nullptr);
+
+        uint32_t getFreeContStack();
+        void resetFreeContStack();
 
         const char * getSdkVersion();
         String getCoreVersion();
+        String getFullVersion();
 
         uint8_t getBootVersion();
         uint8_t getBootMode();
 
+#if defined(F_CPU) || defined(CORE_MOCK)
+        constexpr uint8_t getCpuFreqMHz() const
+        {
+            return clockCyclesPerMicrosecond();
+        }
+#else
         uint8_t getCpuFreqMHz();
+#endif
 
         uint32_t getFlashChipId();
+        uint8_t getFlashChipVendorId();
+
         //gets the actual chip size based on the flash id
         uint32_t getFlashChipRealSize();
         //gets the size of the flash as set by the compiler
@@ -127,6 +146,8 @@ class EspClass {
         FlashMode_t magicFlashChipMode(uint8_t byte);
 
         bool checkFlashConfig(bool needsEquals = false);
+
+        bool checkFlashCRC();
 
         bool flashEraseSector(uint32_t sector);
         bool flashWrite(uint32_t offset, uint32_t *data, size_t size);
@@ -143,15 +164,24 @@ class EspClass {
 
         bool eraseConfig();
 
-        inline uint32_t getCycleCount();
+        uint8_t *random(uint8_t *resultArray, const size_t outputSizeBytes) const;
+        uint32_t random() const;
+
+#ifndef CORE_MOCK
+        inline uint32_t getCycleCount() __attribute__((always_inline));
+#else
+        uint32_t getCycleCount();
+#endif
 };
+
+#ifndef CORE_MOCK
 
 uint32_t EspClass::getCycleCount()
 {
-    uint32_t ccount;
-    __asm__ __volatile__("esync; rsr %0,ccount":"=a" (ccount));
-    return ccount;
+    return esp_get_cycle_count();
 }
+
+#endif // !defined(CORE_MOCK)
 
 extern EspClass ESP;
 

@@ -1,50 +1,63 @@
-sudo: false
+# TravisCI left in repo as a backup CI solution in case GitHub CI suffers a
+# major disruption.  Only a few, quick tests are run in order to keep the
+# TravisCI runtime equal to the GitHub CI time (to avoid bottlenecking on
+# TravisCI).
+#
+# If GitHub CI goes away, it would make sense to drop this .YML file and
+# use the complete one from release tag 2.7.2
+
+
 language: bash
-os:
-  - linux
+os: linux
+dist: bionic
 
-addons:
-  apt:
-    sources:
-      - ubuntu-toolchain-r-test
-    packages:
-      - g++-4.8
+git:
+  depth: 1
+  submodules: false
 
-script:
-  - set -e
-  - export CXX="g++-4.8" CC="gcc-4.8" GCOV="gcov-4.8"
-  - echo -e "travis_fold:start:host_tests"
-  - pushd $TRAVIS_BUILD_DIR/tests/host
-  - make
-  - make clean-objects
-  - echo -e "travis_fold:end:host_tests"
-  - echo -e "travis_fold:start:sketch_test_env_prepare"
-  - popd
-  - wget -O arduino.tar.xz https://www.arduino.cc/download.php?f=/arduino-nightly-linux64.tar.xz
-  - tar xf arduino.tar.xz
-  - mv arduino-nightly $HOME/arduino_ide
-  - cd $HOME/arduino_ide/hardware
-  - mkdir esp8266com
-  - cd esp8266com
-  - ln -s $TRAVIS_BUILD_DIR esp8266
-  - cd esp8266/tools
-  - python get.py
-  - export PATH="$HOME/arduino_ide:$TRAVIS_BUILD_DIR/tools/xtensa-lx106-elf/bin:$PATH"
-  - which arduino
-  - cd $TRAVIS_BUILD_DIR
-  - source tests/common.sh
-  - install_libraries
-  - echo -e "travis_fold:end:sketch_test_env_prepare"
-  - echo -e "travis_fold:start:sketch_test"
-  - build_sketches $HOME/arduino_ide $TRAVIS_BUILD_DIR/libraries "-l $HOME/Arduino/libraries"
-  - echo -e "travis_fold:end:sketch_test"
-  - echo -e "travis_fold:start:size_report"
-  - cat size.log
-  - echo -e "travis_fold:end:size_report"
+before_install:
+  - git submodule update --init  # no recursive update
 
-after_success:
-    - pushd $TRAVIS_BUILD_DIR/tests/host
-    - bash <(curl -s https://codecov.io/bash) -X gcov
+stages:
+  - build
+  - deploy
+
+
+# Run only 5 jobs since TravisCI only allows 5 in parallel
+jobs:
+  include:
+    - name: "Platform.IO"
+      stage: build
+      script: $TRAVIS_BUILD_DIR/tests/platformio.sh
+      install:
+          - sudo apt-get install python3-pip python3-setuptools
+      env:
+        # PIO is very slow, so do 1/2 as many builds as Arduino
+        - BUILD_PARITY=custom mod=20 rem=5
+
+    - name: "Build 1/4"
+      stage: build
+      script: $TRAVIS_BUILD_DIR/tests/build.sh
+      env:
+        - BUILD_PARITY=custom mod=10 rem=1
+
+    - name: "Build 2/4"
+      stage: build
+      script: $TRAVIS_BUILD_DIR/tests/build.sh
+      env:
+        - BUILD_PARITY=custom mod=10 rem=2
+
+    - name: "Build 3/4"
+      stage: build
+      script: $TRAVIS_BUILD_DIR/tests/build.sh
+      env:
+        - BUILD_PARITY=custom mod=10 rem=3
+
+    - name: "Build 4/4"
+      stage: build
+      script: $TRAVIS_BUILD_DIR/tests/build.sh
+      env:
+        - BUILD_PARITY=custom mod=10 rem=4
 
 notifications:
   email:
