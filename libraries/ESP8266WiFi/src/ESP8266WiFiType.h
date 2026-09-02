@@ -47,6 +47,13 @@ typedef enum WiFiSleepType
     WIFI_NONE_SLEEP = 0, WIFI_LIGHT_SLEEP = 1, WIFI_MODEM_SLEEP = 2
 } WiFiSleepType_t;
 
+// ESP32 compatibility
+typedef enum wifi_ps_type
+{
+    WIFI_PS_NONE = WIFI_NONE_SLEEP,
+    WIFI_PS_MIN_MODEM = WIFI_MODEM_SLEEP,
+    WIFI_PS_MAX_MODEM = WIFI_LIGHT_SLEEP,
+} wifi_ps_type_t;
 
 typedef enum WiFiEvent 
 {
@@ -58,9 +65,10 @@ typedef enum WiFiEvent
     WIFI_EVENT_SOFTAPMODE_STACONNECTED,
     WIFI_EVENT_SOFTAPMODE_STADISCONNECTED,
     WIFI_EVENT_SOFTAPMODE_PROBEREQRECVED,
+    WIFI_EVENT_MODE_CHANGE,
+    WIFI_EVENT_SOFTAPMODE_DISTRIBUTE_STA_IP,
     WIFI_EVENT_MAX,
     WIFI_EVENT_ANY = WIFI_EVENT_MAX,
-    WIFI_EVENT_MODE_CHANGE
 } WiFiEvent_t;
 
 enum WiFiDisconnectReason 
@@ -147,10 +155,5 @@ struct WiFiEventSoftAPModeProbeRequestReceived
     uint8 mac[6];
 };
 
-
-extern "C" {
-typedef STAILQ_HEAD(, bss_info)
-bss_info_head_t;
-}
 
 #endif /* ESP8266WIFITYPE_H_ */

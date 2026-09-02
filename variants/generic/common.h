@@ -30,8 +30,10 @@
 #define NUM_DIGITAL_PINS        17
 #define NUM_ANALOG_INPUTS       1
 
-// TODO: this should be <= 9 if flash is in DIO mode
-#define isFlashInterfacePin(p)      ((p) >= 6 && (p) <= 11)
+#define isFlashInterfacePin(p)\
+    (esp_is_8285()\
+     ? ((p) == 6 || (p) == 7 || (p) == 8 || (p) == 11)\
+     : ((p) >= 6 && (p) <= 11))
 
 #define analogInputToDigitalPin(p)  ((p > 0) ? NOT_A_PIN : 0)
 #define digitalPinToInterrupt(p)    (((p) < EXTERNAL_NUM_INTERRUPTS)? (p) : NOT_AN_INTERRUPT)
@@ -47,7 +49,9 @@ static const uint8_t MOSI  = PIN_SPI_MOSI;
 static const uint8_t MISO  = PIN_SPI_MISO;
 static const uint8_t SCK   = PIN_SPI_SCK;
 
+#ifndef PIN_A0
 #define PIN_A0 (17)
+#endif /* PIN_A0 */
 
 static const uint8_t A0 = PIN_A0;
 
@@ -70,5 +74,12 @@ static const uint8_t A0 = PIN_A0;
 #define SERIAL_PORT_USBVIRTUAL     Serial
 #define SERIAL_PORT_HARDWARE       Serial
 #define SERIAL_PORT_HARDWARE_OPEN  Serial1
+
+#ifdef LED_BUILTIN
+#ifdef __cplusplus
+extern "C"
+#endif
+const int BUILTIN_LED __attribute__((deprecated("use LED_BUILTIN"), weak)) = LED_BUILTIN;
+#endif
 
 #endif /* GENERIC_COMMON_H */

@@ -1,99 +1,212 @@
 SHELL := /bin/bash
-V ?= 0
-TEST_LIST ?= $(wildcard test_*/*.ino)
-ESP8266_CORE_PATH ?= ../..
-BUILD_DIR ?= $(PWD)/.build
-HARDWARE_DIR ?= $(PWD)/.hardware
-ESPTOOL ?= $(ESP8266_CORE_PATH)/tools/esptool/esptool
+
+ESP8266_CORE_PATH ?= $(shell git rev-parse --show-toplevel)
+
+BUILD_DIR ?= $(PWD)/build
+BS_DIR ?= $(PWD)/libraries/BSTest
+
+PYTHON ?= python3
+ESPTOOL ?= $(PYTHON) $(ESP8266_CORE_PATH)/tools/esptool/esptool.py
+
+VENV_PYTHON ?= $(BS_DIR)/virtualenv/bin/python
+VENV_JUNIT2HTML ?= $(BS_DIR)/virtualenv/bin/junit2html
+
+MKFS ?= $(ESP8266_CORE_PATH)/tools/mklittlefs/mklittlefs
+
 UPLOAD_PORT ?= $(shell ls /dev/tty* | grep -m 1 -i USB)
-UPLOAD_BAUD ?= 921600
-UPLOAD_BOARD ?= nodemcu
-BS_DIR ?= libraries/BSTest
-DEBUG_LEVEL ?= DebugLevel=None____
-FQBN ?= esp8266com:esp8266:generic:CpuFrequency=80,FlashFreq=40,FlashMode=DIO,UploadSpeed=115200,FlashSize=4M1M,ResetMethod=none,Debug=Serial,$(DEBUG_LEVEL)
-BUILD_TOOL = $(ARDUINO_IDE_PATH)/arduino-builder
-TEST_CONFIG = libraries/test_config/test_config.h
+UPLOAD_BAUD ?= 460800
 
-ifeq ("$(UPLOAD_PORT)","")
-$(error "Failed to detect upload port, please export UPLOAD_PORT manually")
+TEST_BAUD ?= 115200
+BUILD_TOOL ?= arduino-cli
+
+BUILD_BOARD ?= generic
+BUILD_CPU ?= 160
+BUILD_SIZE ?= 4M1M
+BUILD_LWIP ?= lm2f
+BUILD_EXTRA ?= ,dbg=Serial,lvl=CORE
+
+FQBN ?= esp8266com:esp8266:$(BUILD_BOARD):xtal=$(BUILD_CPU),baud=$(TEST_BAUD),eesz=$(BUILD_SIZE),ip=$(BUILD_LWIP)$(BUILD_EXTRA)
+
+TEST_CONFIG := test_env.cfg
+TEST_RESULT_XML := test_result.xml
+TEST_REPORT_XML := test_report.xml
+TEST_REPORT_HTML := test_report.html
+
+TEST_LIST ?= $(wildcard test_*/*.ino)
+BUILD_FLAGS ?=
+BS_FLAGS ?=
+
+# To enable a test for mock testing, just rename dir+files to '*_sw_*'
+ifeq ("$(MOCK)", "1")
+	TEST_LIST := $(filter test_sw_%.ino,$(TEST_LIST))
+	NO_UPLOAD := 1
+	NO_RUN := 1
 endif
 
-ifeq ("$(ARDUINO_IDE_PATH)","")
-$(error "Please export ARDUINO_IDE_PATH")
+# To enable verbose mode, call `make V=1` ...
+V ?= 0
+ifeq ("$(V)", "1")
+	BUILD_FLAGS += --verbose
+	BS_FLAGS += --debug
 endif
 
-ifneq ("$(V)","1")
-	SILENT = @
-else
-	BUILDER_DEBUG_FLAG = -verbose
-	RUNNER_DEBUG_FLAG = -d
-	UPLOAD_VERBOSE_FLAG = -v
-endif
+# ${sketch}.py helper script when building locally
+mock_script = \
+	`test -f $(addsuffix .py, $(basename $(1))) && echo "--mock $(addsuffix .py, $(basename $(1)))" || echo ""`
 
+help:
+	@echo
+	@echo 'make list                    - show list of tests'
+	@echo 'make sometest/sometest.ino   - run one test'
+	@echo 'make all                     - run all tests'
+	@echo 'make MOCK=1 all              - run all emulation-on-host compatible tests'
+	@echo 'make options: V=1 NO_BUILD=1 NO_UPLOAD=1 NO_RUN=1 MOCK=1'
+	@echo
 
-all: count tests
+list: showtestlist
 
-count:
-	@echo Running $(words $(TEST_LIST)) tests
+all: count tests test_report
 
-tests: $(BUILD_DIR) $(HARDWARE_DIR) virtualenv $(TEST_CONFIG) $(TEST_LIST)
+$(TEST_LIST): | virtualenv $(TEST_CONFIG) $(BUILD_DIR) $(HARDWARE_DIR)
+
+.NOTPARALLEL: $(TEST_LIST)
+
+tests: showtestlist $(TEST_LIST)
+
+showtestlist:
+	@echo "-------------------------------- test list:"
+	@printf '%s\n' $(TEST_LIST)
+	@echo "--------------------------------"
 
 $(TEST_LIST): LOCAL_BUILD_DIR=$(BUILD_DIR)/$(notdir $@)
+$(TEST_LIST): LOCAL_DATA_IMG=data.img
+
+define build-arduino
+	rm -f $(LOCAL_BUILD_DIR)/build.options.json
+	$(BUILD_TOOL) compile \
+		$(BUILD_FLAGS) \
+		--libraries "$(PWD)/libraries" \
+		--warnings=all \
+		--build-path $(LOCAL_BUILD_DIR) \
+		--fqbn=$(FQBN) \
+		$@
+endef
+
+define build-mock
+	(cd $(ESP8266_CORE_PATH)/test/host; \
+		$(MAKE) D=$(V) ULIBDIRS=$(PWD)/libraries/BSTest $(PWD)/$(@:%.ino=%))
+	$(VENV_PYTHON) $(BS_DIR)/runner.py \
+		$(BS_FLAGS) \
+		--name $(basename $(notdir $@)) \
+		--output $(LOCAL_BUILD_DIR)/$(TEST_RESULT_XML) \
+		--env-file $(TEST_CONFIG) \
+		$(call mock_script,$@) \
+		executable "$(ESP8266_CORE_PATH)/tests/host/bin/$(@:%.ino=%)" || echo ""`
+endef
+
+define upload-data
+	@test -n "$(UPLOAD_PORT)" \
+		|| (echo "Failed to detect upload port, please export UPLOAD_PORT manually" && exit 1)
+	@test ! \( -d $(dir $@)/data/ \) -a \( -e $(dir $@)/make_data.py \) && \
+		(cd $(dir $@) && ./make_data.py ) || echo "Filesystem creation skipped"
+	@test -d $(dir $@)/data/ && ( \
+		$(MKFS) \
+			--create $(dir $@)/data/ \
+			--size 0xFB000 \
+			--block 8192 \
+			--page 256 \
+			$(LOCAL_BUILD_DIR)/$(LOCAL_DATA_IMG) && \
+		$(ESPTOOL) \
+			--chip esp8266 \
+			--port $(UPLOAD_PORT) \
+			--baud $(UPLOAD_BAUD) \
+			--after no_reset \
+			write_flash 0x300000 $(LOCAL_BUILD_DIR)/$(LOCAL_DATA_IMG) ) \
+		&& (echo "Uploaded filesystem") \
+		|| (echo "Filesystem upload skipped")
+endef
+
+define upload-binary
+	@test -n "$(UPLOAD_PORT)" \
+		|| (echo "Failed to detect upload port, please export UPLOAD_PORT manually" && exit 1)
+	$(ESPTOOL) \
+		--chip esp8266 \
+		--port $(UPLOAD_PORT) \
+		--baud $(UPLOAD_BAUD) \
+		--after no_reset \
+		write_flash 0x0 $(LOCAL_BUILD_DIR)/$(notdir $@).bin
+endef
+
+define run-test
+	@test -n "$(UPLOAD_PORT)" \
+		|| (echo "Failed to detect upload port, please export UPLOAD_PORT manually" && exit 1)
+	@echo Running tests
+	$(ESPTOOL) \
+		--chip esp8266 \
+		--port $(UPLOAD_PORT) \
+		--baud $(UPLOAD_BAUD) \
+		read_flash_status # reset via implicit stub reboot
+	$(VENV_PYTHON) $(BS_DIR)/runner.py \
+		$(BS_FLAGS) \
+		--name $(basename $(notdir $@)) \
+		--output $(LOCAL_BUILD_DIR)/$(TEST_RESULT_XML) \
+		--env-file $(TEST_CONFIG) \
+		$(call mock_script,$@) \
+		port $(UPLOAD_PORT) \
+		--baudrate $(TEST_BAUD)
+endef
 
 $(TEST_LIST):
-	$(SILENT)mkdir -p $(LOCAL_BUILD_DIR)
+	@echo "--------------------------------"
+	@echo "Running test '$@' of $(words $(TEST_LIST)) tests"
+	mkdir -p $(LOCAL_BUILD_DIR)
 ifneq ("$(NO_BUILD)","1")
-	@echo Compiling $(notdir $@)
-	$(SILENT)$(BUILD_TOOL) -compile -logger=human \
-		-libraries "$(PWD)/libraries" \
-		-core-api-version="10608" \
-		-warnings=none \
-		$(BUILDER_DEBUG_FLAG) \
-		-build-path $(LOCAL_BUILD_DIR) \
-		-tools $(ARDUINO_IDE_PATH)/tools-builder \
-		-hardware $(HARDWARE_DIR)\
-		-hardware $(ARDUINO_IDE_PATH)/hardware \
-		-fqbn=$(FQBN) \
-		$@
+	@echo Building $(notdir $@)
+ifeq ("$(MOCK)", "1")
+	$(build-mock)
+else
+	$(build-arduino)
+endif
 endif
 ifneq ("$(NO_UPLOAD)","1")
-	$(SILENT)$(ESPTOOL) $(UPLOAD_VERBOSE_FLAG)  \
-		-cp $(UPLOAD_PORT) \
-		-cb $(UPLOAD_BAUD) \
-		-cd $(UPLOAD_BOARD) \
-		-cf $(LOCAL_BUILD_DIR)/$(notdir $@).bin
+	$(upload-filesystem)
+	$(upload-binary)
 endif
 ifneq ("$(NO_RUN)","1")
-	@echo Running tests
-	$(SILENT)$(ESPTOOL) $(UPLOAD_VERBOSE_FLAG) -cp $(UPLOAD_PORT) -cd $(UPLOAD_BOARD) -cr
-	@source $(BS_DIR)/virtualenv/bin/activate && \
-		python $(BS_DIR)/runner.py \
-			$(RUNNER_DEBUG_FLAG) \
-			-p $(UPLOAD_PORT) \
-			-n $(basename $(notdir $@)) \
-			-o $(LOCAL_BUILD_DIR)/test_result.xml \
-			`test -f $(addsuffix .py, $(basename $@)) && echo "-m $(addsuffix .py, $(basename $@))" || echo ""`
+	$(run-test)
 endif
 
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
+$(TEST_REPORT_XML): virtualenv
+	$(BS_DIR)/xunitmerge \
+		$(shell find $(BUILD_DIR) -name '$(TEST_RESULT_XML)' | xargs echo) \
+		$(TEST_REPORT_XML)
 
-$(HARDWARE_DIR):
-	mkdir -p $(HARDWARE_DIR)/esp8266com
-	cd $(HARDWARE_DIR)/esp8266com && ln -s $(realpath $(ESP8266_CORE_PATH)) esp8266
+$(TEST_REPORT_HTML): $(TEST_REPORT_XML) | virtualenv
+	$(VENV_JUNIT2HTML) $< $@
+
+test_report: $(TEST_REPORT_HTML)
+	@echo "Test report generated in $(TEST_REPORT_HTML)"
+
+$(BUILD_DIR):
+	@mkdir -p $(BUILD_DIR)
 
 virtualenv:
-	make -C $(BS_DIR) virtualenv
+	@make -C $(BS_DIR) PYTHON=$(PYTHON) virtualenv
 
 clean:
 	rm -rf $(BUILD_DIR)
-	rm -rf $(HARDWARE_DIR)
+	rm -rf $(BS_DIR)/virtualenv
+	rm -f $(TEST_REPORT_HTML) $(TEST_REPORT_XML)
+
+distclean: clean
+	rm -rf libraries/BSTest/virtualenv/
+	find . -name "*pyc" -exec rm -f {} \;
 
 $(TEST_CONFIG):
 	@echo "******    "
-	@echo "******    libraries/test_config/test_config.h does not exist"
-	@echo "******    Create one from libraries/test_config/test_config.h.template"
+	@echo "******    $(TEST_CONFIG) does not exist"
+	@echo "******    Create one from $(TEST_CONFIG).template"
 	@echo "******    "
-	false
+	@false
 
-.PHONY: tests all count venv $(BUILD_DIR) $(TEST_LIST)
+.PHONY: tests all count virtualenv test_report $(TEST_LIST)

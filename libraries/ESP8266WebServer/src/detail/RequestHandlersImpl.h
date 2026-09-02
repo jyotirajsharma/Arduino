@@ -1,56 +1,92 @@
 #ifndef REQUESTHANDLERSIMPL_H
 #define REQUESTHANDLERSIMPL_H
 
+#include <ESP8266WebServer.h>
 #include "RequestHandler.h"
+#include "mimetable.h"
+#include "WString.h"
+#include "Uri.h"
 
-class FunctionRequestHandler : public RequestHandler {
+namespace esp8266webserver {
+
+String calcETag(FS &, const String &);
+
+template<typename ServerType>
+class FunctionRequestHandler : public RequestHandler<ServerType> {
+    using WebServerType = ESP8266WebServerTemplate<ServerType>;
 public:
-    FunctionRequestHandler(ESP8266WebServer::THandlerFunction fn, ESP8266WebServer::THandlerFunction ufn, const String &uri, HTTPMethod method)
+    FunctionRequestHandler(typename WebServerType::THandlerFunction fn, typename WebServerType::THandlerFunction ufn, const Uri &uri, HTTPMethod method)
     : _fn(fn)
     , _ufn(ufn)
-    , _uri(uri)
+    , _uri(uri.clone())
     , _method(method)
     {
     }
 
-    bool canHandle(HTTPMethod requestMethod, String requestUri) override  {
+    ~FunctionRequestHandler() {
+        delete _uri;
+    }
+
+    bool canHandle(HTTPMethod requestMethod, const String& requestUri) override  {
         if (_method != HTTP_ANY && _method != requestMethod)
             return false;
 
-        if (requestUri != _uri)
-            return false;
-
-        return true;
+        return _uri->canHandle(requestUri, RequestHandler<ServerType>::pathArgs);
     }
 
-    bool canUpload(String requestUri) override  {
+    bool canUpload(const String& requestUri) override  {
         if (!_ufn || !canHandle(HTTP_POST, requestUri))
             return false;
 
         return true;
     }
 
-    bool handle(ESP8266WebServer& server, HTTPMethod requestMethod, String requestUri) override {
-        if (!canHandle(requestMethod, requestUri))
+    bool canHandle(WebServerType& server, HTTPMethod requestMethod, const String& requestUri) override {
+        if (_method != HTTP_ANY && _method != requestMethod)
+            return false;
+
+        return _uri->canHandle(requestUri, RequestHandler<ServerType>::pathArgs) && (_filter != NULL ? _filter(server) : true);
+    }
+
+    bool canUpload(WebServerType& server, const String& requestUri) override {
+        if (!_ufn || !canHandle(server, HTTP_POST, requestUri))
+            return false;
+
+        return true;
+    }
+
+    bool handle(WebServerType& server, HTTPMethod requestMethod, const String& requestUri) override {
+        if (!canHandle(server, requestMethod, requestUri))
             return false;
 
         _fn();
         return true;
     }
 
-    void upload(ESP8266WebServer& server, String requestUri, HTTPUpload& upload) override {
-        if (canUpload(requestUri))
+    void upload(WebServerType& server, const String& requestUri, HTTPUpload& upload) override {
+        (void) upload;
+        if (canUpload(server, requestUri))
             _ufn();
     }
 
+    FunctionRequestHandler& setFilter(typename WebServerType::FilterFunction filter) {
+        _filter = filter;
+        return *this;
+    }
+
 protected:
-    ESP8266WebServer::THandlerFunction _fn;
-    ESP8266WebServer::THandlerFunction _ufn;
-    String _uri;
+    typename WebServerType::THandlerFunction _fn;
+    typename WebServerType::THandlerFunction _ufn;
+    // _filter should return 'true' when the request should be handled
+    // and 'false' when the request should be ignored
+    typename WebServerType::FilterFunction _filter;
+    Uri *_uri;
     HTTPMethod _method;
 };
 
-class StaticRequestHandler : public RequestHandler {
+template<typename ServerType>
+class StaticRequestHandler : public RequestHandler<ServerType> {
+    using WebServerType = ESP8266WebServerTemplate<ServerType>;
 public:
     StaticRequestHandler(FS& fs, const char* path, const char* uri, const char* cache_header)
     : _fs(fs)
@@ -58,83 +94,16 @@ public:
     , _path(path)
     , _cache_header(cache_header)
     {
-        _isFile = fs.exists(path);
-        DEBUGV("StaticRequestHandler: path=%s uri=%s isFile=%d, cache_header=%s\r\n", path, uri, _isFile, cache_header);
-        _baseUriLength = _uri.length();
+        DEBUGV("StaticRequestHandler: path=%s uri=%s, cache_header=%s\r\n", path, uri, cache_header == __null ? "" : cache_header);
     }
 
-    bool canHandle(HTTPMethod requestMethod, String requestUri) override  {
-        if (requestMethod != HTTP_GET)
-            return false;
-
-        if ((_isFile && requestUri != _uri) || !requestUri.startsWith(_uri))
-            return false;
-
-        return true;
+    bool validMethod(HTTPMethod requestMethod){
+        return (requestMethod == HTTP_GET) || (requestMethod == HTTP_HEAD);
     }
 
-    bool handle(ESP8266WebServer& server, HTTPMethod requestMethod, String requestUri) override {
-        if (!canHandle(requestMethod, requestUri))
-            return false;
-
-        DEBUGV("StaticRequestHandler::handle: request=%s _uri=%s\r\n", requestUri.c_str(), _uri.c_str());
-
-        String path(_path);
-
-        if (!_isFile) {
-            // Base URI doesn't point to a file.
-            // If a directory is requested, look for index file.
-            if (requestUri.endsWith("/")) requestUri += "index.htm";
-
-            // Append whatever follows this URI in request to get the file path.
-            path += requestUri.substring(_baseUriLength);
-        }
-        DEBUGV("StaticRequestHandler::handle: path=%s, isFile=%d\r\n", path.c_str(), _isFile);
-
-        String contentType = getContentType(path);
-
-        // look for gz file, only if the original specified path is not a gz.  So part only works to send gzip via content encoding when a non compressed is asked for
-        // if you point the the path to gzip you will serve the gzip as content type "application/x-gzip", not text or javascript etc...
-        if (!path.endsWith(".gz") && !_fs.exists(path))  {
-            String pathWithGz = path + ".gz";
-            if(_fs.exists(pathWithGz))
-                path += ".gz";
-        }
-
-        File f = _fs.open(path, "r");
-        if (!f)
-            return false;
-
-        if (_cache_header.length() != 0)
-            server.sendHeader("Cache-Control", _cache_header);
-
-        server.streamFile(f, contentType);
-        return true;
-    }
-
-    static String getContentType(const String& path) {
-        if (path.endsWith(".html")) return "text/html";
-        else if (path.endsWith(".htm")) return "text/html";
-        else if (path.endsWith(".css")) return "text/css";
-        else if (path.endsWith(".txt")) return "text/plain";
-        else if (path.endsWith(".js")) return "application/javascript";
-        else if (path.endsWith(".png")) return "image/png";
-        else if (path.endsWith(".gif")) return "image/gif";
-        else if (path.endsWith(".jpg")) return "image/jpeg";
-        else if (path.endsWith(".ico")) return "image/x-icon";
-        else if (path.endsWith(".svg")) return "image/svg+xml";
-        else if (path.endsWith(".ttf")) return "application/x-font-ttf";
-        else if (path.endsWith(".otf")) return "application/x-font-opentype";
-        else if (path.endsWith(".woff")) return "application/font-woff";
-        else if (path.endsWith(".woff2")) return "application/font-woff2";
-        else if (path.endsWith(".eot")) return "application/vnd.ms-fontobject";
-        else if (path.endsWith(".sfnt")) return "application/font-sfnt";
-        else if (path.endsWith(".xml")) return "text/xml";
-        else if (path.endsWith(".pdf")) return "application/pdf";
-        else if (path.endsWith(".zip")) return "application/zip";
-        else if(path.endsWith(".gz")) return "application/x-gzip";
-        else if (path.endsWith(".appcache")) return "text/cache-manifest";
-        return "application/octet-stream";
+    /* Deprecated version. Please use mime::getContentType instead */
+    static String getContentType(const String& path) __attribute__((deprecated)) {
+        return mime::getContentType(path);
     }
 
 protected:
@@ -142,9 +111,185 @@ protected:
     String _uri;
     String _path;
     String _cache_header;
-    bool _isFile;
-    size_t _baseUriLength;
 };
 
+
+// serve all files within a given directory
+template<typename ServerType>
+class StaticDirectoryRequestHandler : public StaticRequestHandler<ServerType> {
+    using SRH = StaticRequestHandler<ServerType>;
+    using WebServerType = ESP8266WebServerTemplate<ServerType>;
+
+public:
+    StaticDirectoryRequestHandler(FS& fs, const char* path, const char* uri, const char* cache_header)
+        :
+    SRH(fs, path, uri, cache_header),
+    _baseUriLength{SRH::_uri.length()}
+    {}
+
+    bool canHandle(HTTPMethod requestMethod, const String& requestUri) override {
+        return SRH::validMethod(requestMethod) && requestUri.startsWith(SRH::_uri);
+    }
+
+    bool canHandle(WebServerType& server, HTTPMethod requestMethod, const String& requestUri) override {
+        return SRH::validMethod(requestMethod) && requestUri.startsWith(SRH::_uri) && (_filter != NULL ? _filter(server) : true);
+    }
+
+    bool handle(WebServerType& server, HTTPMethod requestMethod, const String& requestUri) override {
+        if (!canHandle(server, requestMethod, requestUri))
+            return false;
+
+        DEBUGV("DirectoryRequestHandler::handle: request=%s _uri=%s\r\n", requestUri.c_str(), SRH::_uri.c_str());
+
+        String path;
+        String eTagCode;
+        path.reserve(SRH::_path.length() + requestUri.length() + 32);
+        path = SRH::_path;
+
+        // Append whatever follows this URI in request to get the file path.
+        path += requestUri.substring(_baseUriLength);
+
+        // Base URI doesn't point to a file.
+        // If a directory is requested, look for index file.
+        if (path.endsWith("/"))
+            path += F("index.htm");
+
+        // If neither <blah> nor <blah>.gz exist, and <blah> is a file.htm, try it with file.html instead
+        // For the normal case this will give a search order of index.htm, index.htm.gz, index.html, index.html.gz
+        if (!SRH::_fs.exists(path) && !SRH::_fs.exists(path + ".gz") && path.endsWith(".htm")) {
+            path += 'l';
+        }
+
+        DEBUGV("DirectoryRequestHandler::handle: path=%s\r\n", path.c_str());
+
+        String contentType = mime::getContentType(path);
+
+        using namespace mime;
+        // look for gz file, only if the original specified path is not a gz.  So part only works to send gzip via content encoding when a non compressed is asked for
+        // if you point the the path to gzip you will serve the gzip as content type "application/x-gzip", not text or javascript etc...
+        if (!path.endsWith(FPSTR(mimeTable[gz].endsWith)) && !SRH::_fs.exists(path))  {
+            String pathWithGz = path + FPSTR(mimeTable[gz].endsWith);
+            if(SRH::_fs.exists(pathWithGz))
+                path += FPSTR(mimeTable[gz].endsWith);
+        }
+
+        File f = SRH::_fs.open(path, "r");
+        if (!f)
+            return false;
+
+        if (!f.isFile()) {
+            f.close();
+            return false;
+        }
+
+        if (server._eTagEnabled) {
+            if (server._eTagFunction) {
+                eTagCode = (server._eTagFunction)(SRH::_fs, path);
+            } else {
+                eTagCode = esp8266webserver::calcETag(SRH::_fs, path);
+            }
+
+            if (server.header("If-None-Match") == eTagCode) {
+                server.send(304);
+                return true;
+            }
+        }
+
+        if (SRH::_cache_header.length() != 0)
+            server.sendHeader("Cache-Control", SRH::_cache_header);
+
+        if ((server._eTagEnabled) && (eTagCode.length() > 0)) {
+            server.sendHeader("ETag", eTagCode);
+        }
+
+        server.streamFile(f, contentType, requestMethod);
+
+        return true;
+    }
+
+    StaticDirectoryRequestHandler& setFilter(typename WebServerType::FilterFunction filter) {
+        _filter = filter;
+        return *this;
+    }
+
+protected:
+    size_t _baseUriLength;
+    typename WebServerType::FilterFunction _filter;
+};
+
+
+// Serve a specific, single file
+template<typename ServerType>
+class StaticFileRequestHandler
+    :
+public StaticRequestHandler<ServerType> {
+
+    using SRH = StaticRequestHandler<ServerType>;
+    using WebServerType = ESP8266WebServerTemplate<ServerType>;
+
+public:
+    StaticFileRequestHandler(FS& fs, const char* path, const char* uri, const char* cache_header)
+        :
+    StaticRequestHandler<ServerType>{fs, path, uri, cache_header}
+    {
+    }
+
+    bool canHandle(HTTPMethod requestMethod, const String& requestUri) override  {
+        return SRH::validMethod(requestMethod) && requestUri == SRH::_uri;
+    }
+
+    bool canHandle(WebServerType& server, HTTPMethod requestMethod, const String& requestUri) override {
+        return SRH::validMethod(requestMethod) && requestUri == SRH::_uri && (_filter != NULL ? _filter(server) : true);
+    }
+
+    bool handle(WebServerType& server, HTTPMethod requestMethod, const String & requestUri) override {
+        if (!canHandle(server, requestMethod, requestUri))
+            return false;
+
+        if (server._eTagEnabled) {
+            if (server._eTagFunction) {
+                _eTagCode = (server._eTagFunction)(SRH::_fs, SRH::_path);
+            } else  if (_eTagCode.isEmpty()) {
+                _eTagCode = esp8266webserver::calcETag(SRH::_fs, SRH::_path);
+            }
+
+            if (server.header("If-None-Match") == _eTagCode) {
+                server.send(304);
+                return true;
+            }
+        }
+
+        File f = SRH::_fs.open(SRH::_path, "r");
+
+        if (!f)
+            return false;
+
+        if (!f.isFile()) {
+            f.close();
+            return false;
+        }
+
+        if (SRH::_cache_header.length() != 0)
+            server.sendHeader("Cache-Control", SRH::_cache_header);
+
+        if ((server._eTagEnabled) && (_eTagCode.length() > 0)) {
+            server.sendHeader("ETag", _eTagCode);
+        }
+
+        server.streamFile(f, mime::getContentType(SRH::_path), requestMethod);
+        return true;
+    }
+
+    StaticFileRequestHandler& setFilter(typename WebServerType::FilterFunction filter) {
+        _filter = filter;
+        return *this;
+    }
+
+protected:
+    String _eTagCode; // ETag code calculated for this file as used in http header include quotes.
+    typename WebServerType::FilterFunction _filter;
+};
+
+} // namespace
 
 #endif //REQUESTHANDLERSIMPL_H

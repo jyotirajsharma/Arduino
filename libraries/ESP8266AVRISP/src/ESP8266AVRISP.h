@@ -71,7 +71,7 @@ protected:
 
     inline void _reject_incoming(void);     // reject any incoming tcp connections
 
-    int avrisp(void);           // handle incoming STK500 commands
+    void avrisp(void);           // handle incoming STK500 commands
 
     uint8_t getch(void);        // retrieve a character from the remote end
     uint8_t spi_transaction(uint8_t, uint8_t, uint8_t, uint8_t);
@@ -89,8 +89,8 @@ protected:
     void commit(int addr);
     void program_page();
     uint8_t flash_read(uint8_t hilo, int addr);
-    void flash_read_page(int length);
-    void eeprom_read_page(int length);
+    bool flash_read_page(int length);
+    bool eeprom_read_page(int length);
     void read_page();
     void read_signature();
 

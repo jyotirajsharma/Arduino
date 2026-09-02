@@ -20,11 +20,9 @@
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
-#define LWIP_INTERNAL
-
 extern "C"
 {
-    #include "include/wl_definitions.h"
+    #include "wl_definitions.h"
     #include "osapi.h"
     #include "ets_sys.h"
 }
@@ -38,25 +36,60 @@ extern "C"
 #include "lwip/tcp.h"
 #include "lwip/inet.h"
 #include "lwip/netif.h"
-#include "include/ClientContext.h"
+#include <include/ClientContext.h>
 #include "c_types.h"
+#include <StreamDev.h>
 
 uint16_t WiFiClient::_localPort = 0;
+
+static bool defaultNoDelay = false; // false == Nagle enabled by default
+static bool defaultSync = false;
+
+bool getDefaultPrivateGlobalSyncValue ()
+{
+    return defaultSync;
+}
+
+void WiFiClient::setDefaultNoDelay (bool noDelay)
+{
+    defaultNoDelay = noDelay;
+}
+
+void WiFiClient::setDefaultSync (bool sync)
+{
+    defaultSync = sync;
+}
+
+bool WiFiClient::getDefaultNoDelay ()
+{
+    return defaultNoDelay;
+}
+
+bool WiFiClient::getDefaultSync ()
+{
+    return defaultSync;
+}
 
 template<>
 WiFiClient* SList<WiFiClient>::_s_first = 0;
 
 
 WiFiClient::WiFiClient()
-: _client(0)
+: _client(0), _owned(0)
 {
+    _timeout = 5000;
     WiFiClient::_add(this);
 }
 
-WiFiClient::WiFiClient(ClientContext* client) : _client(client)
+WiFiClient::WiFiClient(ClientContext* client)
+: _client(client), _owned(0)
 {
+    _timeout = 5000;
     _client->ref();
     WiFiClient::_add(this);
+
+    setSync(defaultSync);
+    setNoDelay(defaultNoDelay);
 }
 
 WiFiClient::~WiFiClient()
@@ -66,9 +99,16 @@ WiFiClient::~WiFiClient()
         _client->unref();
 }
 
+std::unique_ptr<WiFiClient> WiFiClient::clone() const {
+    return std::make_unique<WiFiClient>(*this);
+}
+
 WiFiClient::WiFiClient(const WiFiClient& other)
 {
     _client = other._client;
+    _timeout = other._timeout;
+    _localPort = other._localPort;
+    _owned = other._owned;
     if (_client)
         _client->ref();
     WiFiClient::_add(this);
@@ -79,37 +119,35 @@ WiFiClient& WiFiClient::operator=(const WiFiClient& other)
    if (_client)
         _client->unref();
     _client = other._client;
+    _timeout = other._timeout;
+    _localPort = other._localPort;
+    _owned = other._owned;
     if (_client)
         _client->ref();
     return *this;
 }
 
-
 int WiFiClient::connect(const char* host, uint16_t port)
 {
     IPAddress remote_addr;
-    if (WiFi.hostByName(host, remote_addr))
+    if (WiFi.hostByName(host, remote_addr, _timeout))
     {
         return connect(remote_addr, port);
     }
     return 0;
 }
 
+int WiFiClient::connect(const String& host, uint16_t port)
+{
+    return connect(host.c_str(), port);
+}
+
 int WiFiClient::connect(IPAddress ip, uint16_t port)
 {
-    ip_addr_t addr;
-    addr.addr = ip;
-
-    if (_client)
+    if (_client) {
         stop();
-
-    // if the default interface is down, tcp_connect exits early without
-    // ever calling tcp_err
-    // http://lists.gnu.org/archive/html/lwip-devel/2010-05/msg00001.html
-    netif* interface = ip_route(&addr);
-    if (!interface) {
-        DEBUGV("no route to host\r\n");
-        return 0;
+        _client->unref();
+        _client = nullptr;
     }
 
     tcp_pcb* pcb = tcp_new();
@@ -120,34 +158,21 @@ int WiFiClient::connect(IPAddress ip, uint16_t port)
         pcb->local_port = _localPort++;
     }
 
-    tcp_arg(pcb, this);
-    tcp_err(pcb, &WiFiClient::_s_err);
-    tcp_connect(pcb, &addr, port, reinterpret_cast<tcp_connected_fn>(&WiFiClient::_s_connected));
-
-    esp_yield();
-    if (_client)
-        return 1;
-
-    //  if tcp_error was called, pcb has already been destroyed.
-    // tcp_abort(pcb);
-    return 0;
-}
-
-int8_t WiFiClient::_connected(void* pcb, int8_t err)
-{
-    tcp_pcb* tpcb = reinterpret_cast<tcp_pcb*>(pcb);
-    _client = new ClientContext(tpcb, 0, 0);
+    _client = new ClientContext(pcb, nullptr, nullptr);
     _client->ref();
-    esp_schedule();
-    return ERR_OK;
-}
+    _client->setTimeout(_timeout);
+    int res = _client->connect(ip, port);
+    if (res == 0) {
+        _client->unref();
+        _client = nullptr;
+        return 0;
+    }
 
-void WiFiClient::_err(int8_t err)
-{
-    DEBUGV(":err %d\r\n", err);
-    esp_schedule();
-}
+    setSync(defaultSync);
+    setNoDelay(defaultNoDelay);
 
+    return 1;
+}
 
 void WiFiClient::setNoDelay(bool nodelay) {
     if (!_client)
@@ -155,10 +180,29 @@ void WiFiClient::setNoDelay(bool nodelay) {
     _client->setNoDelay(nodelay);
 }
 
-bool WiFiClient::getNoDelay() {
+bool WiFiClient::getNoDelay() const {
     if (!_client)
         return false;
     return _client->getNoDelay();
+}
+
+void WiFiClient::setSync(bool sync)
+{
+    if (!_client)
+        return;
+    _client->setSync(sync);
+}
+
+bool WiFiClient::getSync() const
+{
+    if (!_client)
+        return false;
+    return _client->getSync();
+}
+
+int WiFiClient::availableForWrite ()
+{
+    return _client? _client->availableForWrite(): 0;
 }
 
 size_t WiFiClient::write(uint8_t b)
@@ -172,21 +216,20 @@ size_t WiFiClient::write(const uint8_t *buf, size_t size)
     {
         return 0;
     }
-    return _client->write(buf, size);
-}
-
-size_t WiFiClient::write(Stream& stream, size_t unused)
-{
-    return WiFiClient::write(stream);
+    _client->setTimeout(_timeout);
+    return _client->write((const char*)buf, size);
 }
 
 size_t WiFiClient::write(Stream& stream)
 {
+    // (this method is deprecated)
+
     if (!_client || !stream.available())
     {
         return 0;
     }
-    return _client->write(stream);
+    // core up to 2.7.4 was equivalent to this
+    return stream.sendAll(this);
 }
 
 size_t WiFiClient::write_P(PGM_P buf, size_t size)
@@ -195,13 +238,15 @@ size_t WiFiClient::write_P(PGM_P buf, size_t size)
     {
         return 0;
     }
-    return _client->write_P(buf, size);
+    _client->setTimeout(_timeout);
+    StreamConstPtr nopeek(buf, size);
+    return nopeek.sendAll(this);
 }
 
 int WiFiClient::available()
 {
     if (!_client)
-        return false;
+        return 0;
 
     int result = _client->getSize();
 
@@ -219,10 +264,14 @@ int WiFiClient::read()
     return _client->read();
 }
 
-
 int WiFiClient::read(uint8_t* buf, size_t size)
 {
-    return (int) _client->read(reinterpret_cast<char*>(buf), size);
+    return (int)_client->read((char*)buf, size);
+}
+
+int WiFiClient::read(char* buf, size_t size)
+{
+    return (int)_client->read(buf, size);
 }
 
 int WiFiClient::peek()
@@ -254,24 +303,30 @@ size_t WiFiClient::peekBytes(uint8_t *buffer, size_t length) {
     return _client->peekBytes((char *)buffer, count);
 }
 
-void WiFiClient::flush()
-{
-    if (_client)
-        _client->flush();
-}
-
-void WiFiClient::stop()
+bool WiFiClient::flush(unsigned int maxWaitMs)
 {
     if (!_client)
-        return;
+        return true;
 
-    _client->unref();
-    _client = 0;
+    if (maxWaitMs == 0)
+        maxWaitMs = WIFICLIENT_MAX_FLUSH_WAIT_MS;
+    return _client->wait_until_acked(maxWaitMs);
+}
+
+bool WiFiClient::stop(unsigned int maxWaitMs)
+{
+    if (!_client)
+        return true;
+
+    bool ret = flush(maxWaitMs); // virtual, may be ssl's
+    if (_client->close() != ERR_OK)
+        ret = false;
+    return ret;
 }
 
 uint8_t WiFiClient::connected()
 {
-    if (!_client)
+    if (!_client || _client->state() == CLOSED)
         return 0;
 
     return _client->state() == ESTABLISHED || available();
@@ -284,17 +339,17 @@ uint8_t WiFiClient::status()
     return _client->state();
 }
 
- WiFiClient::operator bool()
+WiFiClient::operator bool()
 {
-    return _client != 0;
+    return available() || connected();
 }
 
 IPAddress WiFiClient::remoteIP()
 {
-    if (!_client)
+    if (!_client || !_client->getRemoteAddress())
         return IPAddress(0U);
 
-    return IPAddress(_client->getRemoteAddress());
+    return _client->getRemoteAddress();
 }
 
 uint16_t WiFiClient::remotePort()
@@ -307,7 +362,7 @@ uint16_t WiFiClient::remotePort()
 
 IPAddress WiFiClient::localIP()
 {
-    if (!_client)
+    if (!_client || !_client->getLocalAddress())
         return IPAddress(0U);
 
     return IPAddress(_client->getLocalAddress());
@@ -321,14 +376,15 @@ uint16_t WiFiClient::localPort()
     return _client->getLocalPort();
 }
 
-int8_t WiFiClient::_s_connected(void* arg, void* tpcb, int8_t err)
+// Api for heap saving. Optional use instead of WiFiClient::stop to systematically retreive some heap memory
+// and avoiding server crashes in case of frequent clients connections.
+void WiFiClient::abort()
 {
-    return reinterpret_cast<WiFiClient*>(arg)->_connected(tpcb, err);
-}
+    if (!_client)
+        return;
 
-void WiFiClient::_s_err(void* arg, int8_t err)
-{
-    reinterpret_cast<WiFiClient*>(arg)->_err(err);
+    flush(0); // Flush output buffer. Don't make any use of return boolean.
+	_client->abort(); // Wich in turn calls tcp_abort which calls tcp_abandon().
 }
 
 void WiFiClient::stopAll()
@@ -339,11 +395,71 @@ void WiFiClient::stopAll()
 }
 
 
-void WiFiClient::stopAllExcept(WiFiClient* except) 
+void WiFiClient::stopAllExcept(WiFiClient* except)
 {
+    // Stop all will look at the lowest-level wrapper connections only
+    while (except->_owned) {
+         except = except->_owned;
+    }
     for (WiFiClient* it = _s_first; it; it = it->_next) {
-        if (it != except) {
-            it->stop();
+        WiFiClient* conn = it;
+        // Find the lowest-level owner of the current list entry
+        while (conn->_owned) {
+            conn = conn->_owned;
+        }
+        if (conn != except) {
+            conn->stop();
         }
     }
+}
+
+
+void WiFiClient::keepAlive (uint16_t idle_sec, uint16_t intv_sec, uint8_t count)
+{
+    _client->keepAlive(idle_sec, intv_sec, count);
+}
+
+bool WiFiClient::isKeepAliveEnabled () const
+{
+    return _client->isKeepAliveEnabled();
+}
+
+uint16_t WiFiClient::getKeepAliveIdle () const
+{
+    return _client->getKeepAliveIdle();
+}
+
+uint16_t WiFiClient::getKeepAliveInterval () const
+{
+    return _client->getKeepAliveInterval();
+}
+
+uint8_t WiFiClient::getKeepAliveCount () const
+{
+    return _client->getKeepAliveCount();
+}
+
+bool WiFiClient::hasPeekBufferAPI () const
+{
+    return true;
+}
+
+// return a pointer to available data buffer (size = peekAvailable())
+// semantic forbids any kind of read() before calling peekConsume()
+const char* WiFiClient::peekBuffer ()
+{
+    return _client? _client->peekBuffer(): nullptr;
+}
+
+// return number of byte accessible by peekBuffer()
+size_t WiFiClient::peekAvailable ()
+{
+    return _client? _client->peekAvailable(): 0;
+}
+
+// consume bytes after use (see peekBuffer)
+void WiFiClient::peekConsume (size_t consume)
+{
+    if (_client)
+        _client->peekConsume(consume);
 }
